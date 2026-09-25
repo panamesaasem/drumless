@@ -9,11 +9,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+import julius
 import numpy as np
 import soundfile as sf
 import torch
 from demucs.api import Separator
-from demucs.audio import AudioFile
+from demucs.audio import AudioFile, convert_audio_channels
 
 
 def pick_file() -> Path | None:
@@ -37,7 +38,7 @@ def pick_file() -> Path | None:
 
 
 def remove_drums(source: Path, destination: Path, model: str, device: str) -> None:
-    """Estimate the drum stem, then subtract it from FFmpeg's decoded input."""
+    """Subtract estimated drums from FFmpeg's native-rate decoded input."""
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         raise RuntimeError("FFmpeg and ffprobe must be installed and available on PATH.")
 
@@ -47,30 +48,41 @@ def remove_drums(source: Path, destination: Path, model: str, device: str) -> No
     channels = audio.channels(0)
     if channels not in (1, 2):
         raise ValueError(f"Only mono and stereo files are supported (got {channels} channels).")
+    sample_rate = audio.samplerate(0)
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading {model} on {device}. The model is downloaded on first use.", flush=True)
     separator = Separator(model=model, device=device, progress=True)
 
-    # FFmpeg honors MP3/AAC encoder delay metadata. Feeding this exact decoded
-    # waveform to Demucs also keeps the output aligned and the same length.
-    waveform = audio.read(
-        streams=0,
-        samplerate=separator.samplerate,
-        channels=separator.audio_channels,
-    )
-    if waveform.shape[-1] == 0:
+    # FFmpeg honors MP3/AAC encoder delay metadata. Keep its native-rate decode
+    # as the output baseline so non-drum sounds never undergo sample-rate conversion.
+    original = audio.read(streams=0, channels=channels)
+    if original.shape[-1] == 0:
         raise ValueError("The decoded audio is empty.")
+    model_input = convert_audio_channels(original, separator.audio_channels)
+    if sample_rate != separator.samplerate:
+        model_input = julius.resample_frac(
+            model_input, sample_rate, separator.samplerate, full=True
+        )
+    else:
+        # Keep the native-rate baseline independent of Demucs' working tensor.
+        model_input = model_input.clone()
 
     print("Separating drums...", flush=True)
-    original, stems = separator.separate_tensor(waveform, sr=separator.samplerate)
-    without_drums = original - stems["drums"]
+    _, stems = separator.separate_tensor(model_input, sr=separator.samplerate)
+    drums = stems["drums"]
+    if sample_rate != separator.samplerate:
+        drums = julius.resample_frac(
+            drums,
+            separator.samplerate,
+            sample_rate,
+            output_length=original.shape[-1],
+        )
 
     if channels == 1:
-        samples = without_drums.mean(dim=0).detach().cpu().numpy()
-    else:
-        samples = without_drums.T.detach().cpu().numpy()
+        drums = drums.mean(dim=0, keepdim=True)
+    samples = (original - drums).T.detach().cpu().numpy()
     if not np.isfinite(samples).all():
         raise RuntimeError("The model produced invalid audio samples.")
 
@@ -86,7 +98,7 @@ def remove_drums(source: Path, destination: Path, model: str, device: str) -> No
     ) as temporary:
         temporary_path = Path(temporary.name)
     try:
-        sf.write(temporary_path, samples, separator.samplerate, subtype="PCM_24")
+        sf.write(temporary_path, samples, sample_rate, subtype="PCM_24")
         os.replace(temporary_path, destination)
     finally:
         temporary_path.unlink(missing_ok=True)
